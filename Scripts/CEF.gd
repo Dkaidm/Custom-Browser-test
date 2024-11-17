@@ -15,8 +15,16 @@ var failed_loading_count = 0
 var last_failed_loading_time = 0
 var is_loading_blocked = false
 
+# Memory management settings
+var max_tabs = 20  # Maximum number of tabs allowed
+var cleanup_interval = 300.0  # Cleanup every 5 minutes
+var cleanup_timer = 0.0
+var inactive_tab_timeout = 1800.0  # 30 minutes
+var tab_last_active = {}
+
 @onready var mouse_pressed : bool = false
 @onready var tabs_overlay = $TabsOverlay
+@onready var tab_manager = $TabManager
 
 @onready var nodes_to_resize: Array[Node] = [
 	$BlurOverlay,
@@ -98,25 +106,48 @@ func generate_browser_id():
 func create_browser(url):
 	ignore_new_urls = true
 	await get_tree().process_frame
-
-	var browser = $CEF.create_browser(url, $Panel/VBox/TextureRect, {"javascript":true, "frame_rate": 120 })
+	
+	var browser = $CEF.create_browser(url, $Panel/VBox/TextureRect, {
+		"javascript": true,
+		"frame_rate": 60,
+		"background_color": "#FFFFFF",
+		"default_encoding": "UTF-8",
+		"webgl": true,
+		"javascript_flags": "--max-old-space-size=128",
+		"disable_gpu": false,
+		"disable_gpu_compositing": false,
+		"enable_begin_frame_scheduling": true,
+		"enable_media_stream": false,
+		"enable_speech_input": false,
+		"disable_databases": true,
+		"disable_plugins": true,
+		"disable_java": true,
+		"image_loading_enabled": true,
+		"image_shrink_standalone_to_fit": true,
+		"minimum_image_scale_factor": 0.1,
+		"maximum_image_scale_factor": 1.0,
+		"media_playback_requires_user_gesture": true,
+		"default_image_max_size_bytes": 2097152,
+		"cache_path": "user://browser_cache",
+		"cache_size": 52428800,
+		"enable_aggressive_memory_management": true,
+	})
 	if browser == null:
 		$Panel/VBox/HBox2/Info.set_text($CEF.get_error())
 		return null
-
-	var browser_id = generate_browser_id()
-	
-	browsers[browser_id] = browser
-
-	# Loading callbacks
-#	browser.connect("on_html_content_requested", _on_saving_page)
-	browser.connect("on_page_loaded", _on_page_loaded)
-	browser.connect("on_page_failed_loading", _on_page_failed_loading)
-	
-	print("Browser with ID '" + browser_id + "' created with URL " + url)
-	tabs_overlay.add_tab(url)
-
+		
+	var tab_id = tab_manager.create_tab(url, browser)
+	tab_manager.switch_tab(tab_id)
 	return browser
+
+func _on_new_tab_requested(url):
+	create_browser(url)
+
+func _on_close_tab_requested(tab_id):
+	tab_manager.close_tab(tab_id)
+
+func _on_switch_tab_requested(tab_id):
+	tab_manager.switch_tab(tab_id)
 
 func get_browser(browser_id):
 	if not $CEF.is_alive():
@@ -144,10 +175,12 @@ func remove_browser(browser_id: String):
 
 func switch_tab(index: int):
 	var new_browser = get_browser(str(index + 1))
-	
-	if current_browser == new_browser: return
+	if current_browser == new_browser: 
+		return
 	
 	current_browser = new_browser
+	if current_browser:
+		tab_last_active[str(index + 1)] = Time.get_ticks_msec() / 1000.0
 	
 	$Panel/VBox/TextureRect.texture = current_browser.get_texture()
 	current_browser.resize($Panel/VBox/TextureRect.get_size())
@@ -234,6 +267,29 @@ func _on_texture_rect_resized():
 	
 	search_bar.position.x = (panel_size.x - search_bar_size.x) / 2
 	search_bar.position.y = (panel_size.y - search_bar_size.y) / 2
+
+func _process(delta):
+	cleanup_timer += delta
+	if cleanup_timer >= cleanup_interval:
+		cleanup_timer = 0.0
+		cleanup_inactive_tabs()
+
+func cleanup_inactive_tabs():
+	var current_time = Time.get_ticks_msec() / 1000.0  # Convert to seconds
+	var tabs_to_remove = []
+	
+	for browser_id in browsers:
+		if browser_id not in tab_last_active:
+			tab_last_active[browser_id] = current_time
+		
+		if browsers[browser_id] != current_browser:
+			var inactive_time = current_time - tab_last_active[browser_id]
+			if inactive_time > inactive_tab_timeout:
+				tabs_to_remove.append(browser_id)
+	
+	for browser_id in tabs_to_remove:
+		remove_browser(browser_id)
+		print("Removed inactive tab: ", browser_id)
 
 func _ready():
 	var color = Color.from_string(ControlsSingleton.user_data["color"], Color.BLACK)
